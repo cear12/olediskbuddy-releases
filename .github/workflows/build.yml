@@ -1,0 +1,326 @@
+# Builds the private cear12/olediskbuddy-git on this public repo's free Actions minutes.
+#   Actions -> Build -> Run workflow. Needs secret SOURCE_TOKEN (fine-grained PAT,
+#   Contents: read on cear12/olediskbuddy-git). With "publish" ticked and a version
+#   set, creates Release vX.Y.Z here. Only built packages are uploaded; source never is.
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Product version X.Y.Z (empty = version from CMakeLists.txt)"
+        required: false
+        default: ""
+      ref:
+        description: "Branch, tag or SHA of cear12/olediskbuddy-git (empty = default branch)"
+        required: false
+        default: ""
+      publish:
+        description: "Also publish a GitHub Release here (needs an explicit version X.Y.Z)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: cear12/olediskbuddy-git
+  QT_VERSION: "6.11.*"
+  VCPKG_COMMIT: 40dd49b0c9c7dbd79dc64cad5e82308eae04f67f
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      cmake_arg: ${{ steps.v.outputs.cmake_arg }}
+    steps:
+      - id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          v="$INPUT_VERSION"
+          if [[ "$PUBLISH" == "true" && -z "$v" ]]; then
+            echo "::error::Set an explicit version X.Y.Z to publish a release"; exit 1
+          fi
+          if [[ -n "$v" && ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Version '$v' is not X.Y.Z (tags must look like v1.2.3)"; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ -n "$v" ]]; then echo "cmake_arg=-DOLEDISK_VERSION=$v" >> "$GITHUB_OUTPUT"; else echo "cmake_arg=" >> "$GITHUB_OUTPUT"; fi
+          echo "Version: ${v:-<from CMakeLists.txt>}"
+
+  windows:
+    needs: version
+    defaults:
+      run:
+        working-directory: src
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-bincache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: lukka/get-cmake@latest   # CMake >= 3.30 (CPack WiX .NET tool support) + Ninja
+      - uses: jurplel/install-qt-action@v4
+        env:
+          # aqt takes its settings file from this variable; it has no --config flag.
+          AQT_CONFIG: ${{ github.workspace }}/src/.github/qt-settings.ini
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          # aqtinstall 3.3.0 (latest release) does not know the per-arch repository
+          # layout Qt 6.11 uses on Windows (qt6_611x/qt6_611x_msvc2022_64); support landed
+          # in master (7e5a5c3). Drop this pin once aqtinstall 3.4 is released.
+          aqtsource: git+https://github.com/miurahr/aqtinstall.git@076e1659807d0b362a3ed684d54c2e9c775eb9c7
+          modules: qtshadertools
+          cache: true
+          extra: --base https://qt.mirror.constant.com/
+      - name: Ensure Inno Setup 6
+        shell: pwsh
+        run: |
+          # CPack's INNOSETUP generator needs ISCC.exe. The runner image may already ship it.
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            foreach ($dir in @("${env:ProgramFiles(x86)}\Inno Setup 6", "$env:ProgramFiles\Inno Setup 6")) {
+              if (Test-Path (Join-Path $dir "ISCC.exe")) { $iscc = Join-Path $dir "ISCC.exe"; break }
+            }
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup failed with exit code $LASTEXITCODE" }
+          }
+      - name: Create vcpkg binary cache dir
+        shell: bash
+        run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+      - uses: actions/cache@v6
+        with:
+          path: .vcpkg-bincache
+          key: vcpkg-win-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}
+          restore-keys: vcpkg-win-${{ env.VCPKG_COMMIT }}-
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
+      - name: Configure
+        shell: pwsh
+        env:
+          OLEDISK_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # PowerShell splits an unquoted -DX=0.1.0 at the first dot, so build the args explicitly.
+          $extra = @()
+          if ($env:OLEDISK_VERSION) { $extra += "-DOLEDISK_VERSION=$env:OLEDISK_VERSION" }
+          cmake --preset ci-windows "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR" @extra
+      - name: Build
+        run: cmake --build build/ci-windows --parallel
+      - name: Test
+        run: ctest --test-dir build/ci-windows --output-on-failure --no-tests=error
+      # Windows releases ship the Inno Setup installer and the portable ZIP only (no MSI).
+      - name: Package Setup.exe + portable ZIP (smoke-tests the installed tree)
+        shell: pwsh
+        run: .\packaging\windows\package.ps1 -BuildDir build/ci-windows -OutputDir artifacts
+      - name: Smoke-test the Setup.exe (silent per-user install and uninstall)
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem artifacts -Filter "OleDiskBuddy-*-windows-x64-setup.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Setup.exe was not produced" }
+          $proc = Start-Process -FilePath $setup.FullName -Wait -PassThru `
+            -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER")
+          if ($proc.ExitCode -ne 0) { throw "Setup.exe exited with code $($proc.ExitCode)" }
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Ole Disk Buddy"
+          if (-not (Test-Path (Join-Path $dir "bin\OleDiskBuddy.exe"))) { throw "OleDiskBuddy.exe was not installed to $dir\bin" }
+          Write-Host "Installed to $dir"
+          $unins = Join-Path $dir "unins000.exe"
+          if (-not (Test-Path $unins)) { throw "Uninstaller not found: $unins" }
+          Start-Process -FilePath $unins -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait
+          # The Inno uninstaller re-launches itself from %TEMP% and returns at once: wait for it to finish.
+          for ($i = 0; $i -lt 60 -and (Test-Path (Join-Path $dir "bin\OleDiskBuddy.exe")); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path (Join-Path $dir "bin\OleDiskBuddy.exe")) { throw "Uninstall did not remove OleDiskBuddy.exe" }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-windows
+          path: |
+            src/artifacts/OleDiskBuddy-*-windows-x64-setup.exe
+            src/artifacts/OleDiskBuddy-*-windows-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  linux:
+    needs: version
+    defaults:
+      run:
+        working-directory: src
+    # The AppImage runs on distributions with the runner's glibc or newer.
+    # 24.04 is the oldest image whose GCC ships <format> (C++23 code base).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-bincache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build patchelf libfuse2t64 file \
+            autoconf autoconf-archive automake libtool pkg-config \
+            libgl1-mesa-dev libegl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 libfontconfig1 libdbus-1-3
+      - uses: lukka/get-cmake@latest
+      - uses: jurplel/install-qt-action@v4
+        env:
+          AQT_CONFIG: ${{ github.workspace }}/src/.github/qt-settings.ini
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          modules: qtshadertools
+          cache: true
+          extra: --base https://qt.mirror.constant.com/
+      - name: Create vcpkg binary cache dir
+        run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+      - uses: actions/cache@v6
+        with:
+          path: .vcpkg-bincache
+          key: vcpkg-linux-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}
+          restore-keys: vcpkg-linux-${{ env.VCPKG_COMMIT }}-
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
+      - name: Configure
+        run: cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=x64-linux ${{ needs.version.outputs.cmake_arg }}
+      - name: Build
+        run: cmake --build build/ci-unix --parallel
+      - name: Test
+        run: ctest --test-dir build/ci-unix --output-on-failure --no-tests=error
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Package AppImage (smoke-tests the AppDir)
+        run: bash packaging/linux/package.sh build/ci-unix artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-linux
+          path: src/artifacts/*.AppImage
+          if-no-files-found: error
+          retention-days: 1
+
+  macos:
+    needs: version
+    defaults:
+      run:
+        working-directory: src
+    runs-on: macos-15   # Apple Silicon; Xcode 16 libc++ for the C++23 code base
+    timeout-minutes: 150
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-bincache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: lukka/get-cmake@latest
+      - uses: jurplel/install-qt-action@v4
+        env:
+          AQT_CONFIG: ${{ github.workspace }}/src/.github/qt-settings.ini
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: clang_64
+          modules: qtshadertools
+          cache: true
+          extra: --base https://qt.mirror.constant.com/
+      - name: Install vcpkg host tools
+        run: brew install autoconf autoconf-archive automake libtool pkg-config
+      - name: Create vcpkg binary cache dir
+        run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+      - uses: actions/cache@v6
+        with:
+          path: .vcpkg-bincache
+          key: vcpkg-macos-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}
+          restore-keys: vcpkg-macos-${{ env.VCPKG_COMMIT }}-
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
+      - name: Configure
+        run: >
+          cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=arm64-osx
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 ${{ needs.version.outputs.cmake_arg }}
+      - name: Build
+        run: cmake --build build/ci-unix --parallel
+      - name: Test
+        run: ctest --test-dir build/ci-unix --output-on-failure --no-tests=error
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Package DMG (smoke-tests the deployed bundle)
+        run: bash packaging/macos/package.sh build/ci-unix artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-macos
+          path: src/artifacts/*.dmg
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: inputs.publish
+    needs: [version, windows, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASES_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Stable-name copies, checksums, latest.json
+        working-directory: dist
+        run: |
+          for f in OleDiskBuddy-"$VERSION"-*; do
+            cp "$f" "${f/-$VERSION-/-}"
+          done
+          sha256sum OleDiskBuddy-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          python3 - <<'PY'
+          import json, os, hashlib
+          v = os.environ["VERSION"]
+          base = f"https://github.com/{os.environ['RELEASES_REPO']}/releases/download/v{v}/"
+          files = {}
+          for n in sorted(os.listdir(".")):
+              if n.startswith("OleDiskBuddy-") and f"-{v}-" not in n:
+                  h = hashlib.sha256(open(n, "rb").read()).hexdigest()
+                  files[n] = {"url": base + n, "sha256": h, "size": os.path.getsize(n)}
+          json.dump({"version": v, "files": files}, open("latest.json", "w"), indent=2)
+          PY
+          cat latest.json
+      - uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: Ole Disk Buddy ${{ env.VERSION }}
+          tag_name: v${{ env.VERSION }}
+          files: dist/*
+          fail_on_unmatched_files: true

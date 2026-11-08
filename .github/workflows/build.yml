@@ -208,7 +208,14 @@ jobs:
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
       - name: Configure
-        run: cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=x64-linux ${{ needs.version.outputs.cmake_arg }}
+        run: |
+          for i in 1 2 3 4; do
+            cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=x64-linux ${{ needs.version.outputs.cmake_arg }} && exit 0
+            echo "::warning::configure attempt $i failed (vcpkg download flake?), retrying"
+            rm -rf build/ci-unix
+            sleep $((i * 20))
+          done
+          exit 1
       - name: Build
         run: cmake --build build/ci-unix --parallel
       - name: Test
@@ -264,9 +271,15 @@ jobs:
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
       - name: Configure
-        run: >
-          cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=arm64-osx
-          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 ${{ needs.version.outputs.cmake_arg }}
+        run: |
+          for i in 1 2 3 4; do
+            cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=arm64-osx \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 ${{ needs.version.outputs.cmake_arg }} && exit 0
+            echo "::warning::configure attempt $i failed (vcpkg download flake?), retrying"
+            rm -rf build/ci-unix
+            sleep $((i * 20))
+          done
+          exit 1
       - name: Build
         run: cmake --build build/ci-unix --parallel
       - name: Test

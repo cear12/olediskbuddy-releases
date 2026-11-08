@@ -32,6 +32,7 @@ env:
   SOURCE_REPO: cear12/olediskbuddy-git
   QT_VERSION: "6.11.*"
   VCPKG_COMMIT: 40dd49b0c9c7dbd79dc64cad5e82308eae04f67f
+  X_VCPKG_ASSET_SOURCES: "x-script,curl -fsSL --retry 12 --retry-all-errors --retry-delay 10 --retry-max-time 600 -o {dst} {url}"
 
 jobs:
   version:
@@ -213,7 +214,7 @@ jobs:
             cmake --preset ci-unix -DVCPKG_TARGET_TRIPLET=x64-linux ${{ needs.version.outputs.cmake_arg }} && exit 0
             echo "::warning::configure attempt $i failed (vcpkg download flake?), retrying"
             rm -rf build/ci-unix
-            sleep $((i * 20))
+            sleep $((i * 60))
           done
           exit 1
       - name: Build
@@ -277,7 +278,7 @@ jobs:
               -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 ${{ needs.version.outputs.cmake_arg }} && exit 0
             echo "::warning::configure attempt $i failed (vcpkg download flake?), retrying"
             rm -rf build/ci-unix
-            sleep $((i * 20))
+            sleep $((i * 60))
           done
           exit 1
       - name: Build

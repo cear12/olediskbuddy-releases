@@ -115,6 +115,27 @@ jobs:
           path: .vcpkg-bincache
           key: vcpkg-win-${{ env.VCPKG_COMMIT }}-${{ hashFiles('src/vcpkg.json') }}
           restore-keys: vcpkg-win-${{ env.VCPKG_COMMIT }}-
+      - name: Bootstrap vcpkg with retries
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [[ ! -d vcpkg/.git ]]; then
+            for i in 1 2 3 4 5; do
+              rm -rf vcpkg
+              git clone -n https://github.com/microsoft/vcpkg.git vcpkg && break
+              [[ $i -eq 5 ]] && exit 1
+              sleep $((i * 20))
+            done
+          fi
+          git -C vcpkg checkout --force "$VCPKG_COMMIT"
+          for i in 1 2 3 4 5; do
+            rm -f vcpkg/vcpkg.exe
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o vcpkg/vcpkg.exe \
+              https://github.com/microsoft/vcpkg-tool/releases/download/2026-05-27/vcpkg.exe && break
+            [[ $i -eq 5 ]] && exit 1
+            sleep $((i * 30))
+          done
+          echo "$VCPKG_COMMIT" > vcpkg/vcpkgLastBuiltCommitId
       - uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT }}
